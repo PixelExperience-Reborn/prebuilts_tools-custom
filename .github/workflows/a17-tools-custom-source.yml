@@ -1,0 +1,102 @@
+name: Android17 legacy custom host tools source-only audit
+
+on:
+  push:
+    branches:
+      - audit/a17-tools-custom-host-20261106
+    paths:
+      - 'audit/check_tools_custom_source.py'
+      - 'docs/ANDROID_17_TOOLS_CUSTOM_HOST_AUDIT.md'
+      - '.github/workflows/a17-tools-custom-source.yml'
+  pull_request:
+    paths:
+      - 'audit/check_tools_custom_source.py'
+      - 'docs/ANDROID_17_TOOLS_CUSTOM_HOST_AUDIT.md'
+      - '.github/workflows/a17-tools-custom-source.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-old-custom-tools-exclusion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout only audit text, no archived tool binaries
+        uses: actions/checkout@v4
+        with:
+          filter: blob:none
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            audit/
+            docs/
+            .github/workflows/
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Fetch original old PE Git commit and parent metadata
+        run: |
+          git fetch -q --no-tags --filter=blob:none --depth=2 origin \
+            +refs/heads/seventeen:refs/remotes/origin/seventeen
+      - name: Obtain immutable GitHub historic source tree metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl --fail --silent --show-error --location \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/PixelExperience-Reborn/prebuilts_tools-custom/git/trees/7275f748a09bf6d1cf7bfbf36338dc1a93f1b673?recursive=1" \
+            -o "$RUNNER_TEMP/old-custom-tools-tree.json"
+      - name: Checkout reviewed AOSP17 manifest
+        run: |
+          git clone -q --depth=1 \
+            --branch port/a17-aosp17-manifest-20261102 \
+            https://github.com/PixelExperience-Reborn/manifest.git \
+            "$RUNNER_TEMP/manifest"
+      - name: Check original tool archive identity and official AOSP owners
+        run: |
+          python3 audit/check_tools_custom_source.py \
+            "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/old-custom-tools-tree.json" \
+            "$RUNNER_TEMP/manifest"
+      - name: Run manifest positive and negative regression tests
+        run: |
+          cd "$RUNNER_TEMP/manifest"
+          python3 -m unittest discover -s tools \
+            -p 'test_aosp17_manifest_entrypoint.py' -v
+      - name: Verify effective default manifest using the official repo client
+        run: |
+          curl --fail --silent --show-error --location \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "$RUNNER_TEMP/repo"
+          chmod +x "$RUNNER_TEMP/repo"
+          mkdir -p "$RUNNER_TEMP/repo-graph"
+          cd "$RUNNER_TEMP/repo-graph"
+          "$RUNNER_TEMP/repo" init -q --no-clone-bundle \
+            -u https://github.com/PixelExperience-Reborn/manifest \
+            -b port/a17-aosp17-manifest-20261102 -m default.xml
+          "$RUNNER_TEMP/repo" manifest -o "$RUNNER_TEMP/resolved.xml"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          projects = ET.parse(Path(os.environ["RUNNER_TEMP"]) / "resolved.xml").getroot().findall(".//project")
+          owners = {p.get("path") or p.get("name"): p.get("name") for p in projects}
+          assert len(projects) == 1069 and len(owners) == 1069, "duplicate or missing checkout"
+          assert "prebuilts/tools-custom" not in owners
+          assert "prebuilts_tools-custom" not in owners.values()
+          for path, source in {
+              "prebuilts/build-tools": "platform/prebuilts/build-tools",
+              "prebuilts/tools": "platform/prebuilts/tools",
+              "prebuilts/clang/host/linux-x86": "platform/prebuilts/clang/host/linux-x86",
+              "system/tools/mkbootimg": "platform/system/tools/mkbootimg",
+          }.items():
+              assert owners[path] == source, f"unexpected AOSP17 owner for {path}"
+          print("PASS: official repo selects 1069 unique AOSP17 projects")
+          print("PASS: custom host archive excluded; official platform tools retained")
+          PY
+      - name: Declare validation limits
+        run: |
+          echo "SOURCE ONLY: old tool Git metadata, manifest ownership and negative regressions."
+          echo "NO EXECUTION of old PE binary tools."
+          echo "NOT TESTED: full repo sync, Soong/Make, host ABI, blob extraction, kernel or mondrian runtime."
